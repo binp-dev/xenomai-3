@@ -1,12 +1,12 @@
-xenomai (3.0.1) UNRELEASED; urgency=low
+xenomai (3.0.x) UNRELEASED; urgency=low
 
   [ Xenomai ]
   * Prepare Debian packaging for Xenomai-forge
 
-  [ Alex ]
-  * Release 3.0.1
+  [ Alexey Gerasev ]
+  * Release 3.0.x
 
- -- Alex <alexey.gerasev@gmail.com>  Wed, 25 Nov 2015 13:07:10 +0600
+ -- Alexey Gerasev <alexey.gerasev@gmail.com>  Mon, 25 Jan 2016 14:14:16 +0600
 
 xenomai (2.6.3) unstable; urgency=low
 
