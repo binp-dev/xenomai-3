@@ -1,5 +1,5 @@
 mkdir -p ./build/
-git-buildpackage \
- --git-debian-branch=v3.0.1-deb \
+gbp buildpackage \
+ --git-debian-branch=stable-3.0.x-deb \
  --git-export-dir=./build/ \
  -uc -us
