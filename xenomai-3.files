@@ -944,3 +944,5 @@ utils/net/rtroute.c
 utils/net/tdmacfg.c
 utils/ps/rtps.c
 utils/slackspot/slackspot.c
+.gitignore
+build.sh
