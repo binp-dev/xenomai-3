@@ -964,6 +964,34 @@ ssize_t rtcan_raw_sendmsg(struct rtdm_fd *fd,
     return ret;
 }
 
+/***
+ *  rtcan_raw_select
+ */
+static int rtcan_raw_select(struct rtdm_fd *fd,
+			    rtdm_selector_t *selector,
+			    enum rtdm_selecttype type,
+			    unsigned fd_index)
+{
+    /*
+    struct tcp_socket *ts = rtdm_fd_to_private(fd);
+
+    switch (type) {
+	case XNSELECT_READ:
+	    return rtdm_sem_select(&ts->sock.pending_sem, selector,
+				XNSELECT_READ, fd_index);
+	case XNSELECT_WRITE:
+	    return rtdm_event_select(&ts->send_evt, selector,
+				    XNSELECT_WRITE, fd_index);
+	default:
+	    return -EBADF;
+    }
+
+    return -EINVAL;
+    */
+
+    rtdm_printk("%s function called\n", __FUNCTION__);
+    return -EINVAL;
+}
 
 static struct rtdm_driver rtcan_driver = {
 	.profile_info		= RTDM_PROFILE_INFO(rtcan,
@@ -981,6 +1009,7 @@ static struct rtdm_driver rtcan_driver = {
 		.ioctl_nrt	= rtcan_raw_ioctl,
 		.recvmsg_rt	= rtcan_raw_recvmsg,
 		.sendmsg_rt	= rtcan_raw_sendmsg,
+		.select		= rtcan_raw_select,
 	},
 };
 
