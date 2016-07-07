@@ -989,7 +989,7 @@ static int rtcan_raw_select(struct rtdm_fd *fd,
     return -EINVAL;
     */
 
-    rtdm_printk("%s function called\n", __FUNCTION__);
+    rtdm_printk("%s: function called\n", __FUNCTION__);
     return -EINVAL;
 }
 
@@ -1020,11 +1020,13 @@ static struct rtdm_device rtcan_device = {
 
 int __init rtcan_raw_proto_register(void)
 {
+    rtdm_printk("%s: function called\n", __FUNCTION__);
     return rtdm_dev_register(&rtcan_device);
 }
 
 void __exit rtcan_raw_proto_unregister(void)
 {
+    rtdm_printk("%s: function called\n", __FUNCTION__);
     rtdm_dev_unregister(&rtcan_device);
 }
 
