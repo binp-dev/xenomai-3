@@ -20,7 +20,6 @@
 #include <linux/module.h>
 #include <linux/list.h>
 #include <linux/kernel.h>
-#include <linux/vmalloc.h>
 #include <linux/slab.h>
 #include <linux/poll.h>
 #include <cobalt/kernel/heap.h>
@@ -193,24 +192,24 @@ static void iddp_close(struct rtdm_fd *fd)
 	void *poolmem;
 	u32 poolsz;
 
-	if (sk->name.sipc_port > -1) {
-		cobalt_atomic_enter(s);
-		xnmap_remove(portmap, sk->name.sipc_port);
-		cobalt_atomic_leave(s);
-	}
-
 	rtdm_sem_destroy(&sk->insem);
 	rtdm_waitqueue_destroy(&sk->privwaitq);
 
-	if (sk->handle)
-		xnregistry_remove(sk->handle);
-
-	if (sk->bufpool != &cobalt_heap) {
-		poolmem = xnheap_get_membase(&sk->privpool);
-		poolsz = xnheap_get_size(&sk->privpool);
-		xnheap_destroy(&sk->privpool);
-		free_pages_exact(poolmem, poolsz);
-		return;
+	if (test_bit(_IDDP_BOUND, &sk->status)) {
+		if (sk->handle)
+			xnregistry_remove(sk->handle);
+		if (sk->name.sipc_port > -1) {
+			cobalt_atomic_enter(s);
+			xnmap_remove(portmap, sk->name.sipc_port);
+			cobalt_atomic_leave(s);
+		}
+		if (sk->bufpool != &cobalt_heap) {
+			poolmem = xnheap_get_membase(&sk->privpool);
+			poolsz = xnheap_get_size(&sk->privpool);
+			xnheap_destroy(&sk->privpool);
+			xnheap_vfree(poolmem);
+			return;
+		}
 	}
 
 	/* Send unread datagrams back to the system heap. */
@@ -567,7 +566,7 @@ static int __iddp_bind_socket(struct rtdm_fd *fd,
 	poolsz = sk->poolsz;
 	if (poolsz > 0) {
 		poolsz = xnheap_rounded_size(poolsz);
-		poolmem = alloc_pages_exact(poolsz, GFP_KERNEL);
+		poolmem = xnheap_vmalloc(poolsz);
 		if (poolmem == NULL) {
 			ret = -ENOMEM;
 			goto fail;
@@ -575,7 +574,7 @@ static int __iddp_bind_socket(struct rtdm_fd *fd,
 
 		ret = xnheap_init(&sk->privpool, poolmem, poolsz);
 		if (ret) {
-			free_pages_exact(poolmem, poolsz);
+			xnheap_vfree(poolmem);
 			goto fail;
 		}
 		xnheap_set_name(&sk->privpool, "iddp-pool@%d", port);
@@ -594,7 +593,7 @@ static int __iddp_bind_socket(struct rtdm_fd *fd,
 		if (ret) {
 			if (poolsz > 0) {
 				xnheap_destroy(&sk->privpool);
-				free_pages_exact(poolmem, poolsz);
+				xnheap_vfree(poolmem);
 			}
 			goto fail;
 		}

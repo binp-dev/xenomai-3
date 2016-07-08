@@ -596,8 +596,12 @@ static inline int threadobj_init_corespec(struct threadobj *thobj)
 	 */
 	pthread_condattr_init(&cattr);
 	pthread_condattr_setpshared(&cattr, mutex_scope_attribute);
-	ret = __bt(pthread_condattr_setclock(&cattr, CLOCK_COPPERPLATE));
-	if (ret == 0)
+	ret = __bt(-pthread_condattr_setclock(&cattr, CLOCK_COPPERPLATE));
+	if (ret)
+		warning("failed setting condvar clock, %s"
+			"(try --disable-clock-monotonic-raw)",
+			symerror(ret));
+	else
 		ret = __bt(-pthread_cond_init(&thobj->core.grant_sync, &cattr));
 	pthread_condattr_destroy(&cattr);
 
@@ -1600,7 +1604,7 @@ int threadobj_sleep(const struct timespec *ts)
 		 */
 		if (ts->tv_sec == 0 && ts->tv_nsec == 0) {
 			sigemptyset(&set);
-			ret = __RT(sigwaitinfo(&set, NULL)) ? -errno : 0;
+			ret = __RT(sigwaitinfo(&set, NULL)) ? errno : 0;
 		} else
 			ret = __RT(clock_nanosleep(CLOCK_COPPERPLATE,
 						   TIMER_ABSTIME, ts, NULL));
@@ -1754,13 +1758,13 @@ static inline int main_overlay(void)
 
 	/*
 	 * Make the main() context a basic yet complete thread object,
-	 * so that it may use any services which require the caller to
+	 * so that it may use any service which requires the caller to
 	 * have a Copperplate TCB (e.g. all blocking services). We
 	 * allocate a wait union which should be sufficient for
 	 * calling any blocking service from any high-level API from
-	 * an unshadowed main thread. APIs might have other reasons
-	 * not to allow such call though, in which case they should
-	 * check explicitly for those conditions.
+	 * an unshadowed main thread. APIs might have reasons not to
+	 * allow such call though, in which case they should check
+	 * explicitly for those conditions.
 	 */
 	tcb = __threadobj_alloc(sizeof(*tcb),
 				sizeof(union main_wait_union),

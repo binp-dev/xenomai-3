@@ -19,6 +19,7 @@
 #ifndef _COBALT_KERNEL_THREAD_H
 #define _COBALT_KERNEL_THREAD_H
 
+#include <linux/wait.h>
 #include <linux/sched.h>
 #include <linux/sched/rt.h>
 #include <cobalt/kernel/list.h>
@@ -107,9 +108,6 @@ struct xnthread {
 	struct list_head quota_expired;
 	struct list_head quota_next;
 #endif
-
-	unsigned int idtag;	/* Unique ID tag */
-
 	cpumask_t affinity;	/* Processor affinity. */
 
 	int bprio;		/* Base priority (before PIP boost) */
@@ -184,12 +182,12 @@ struct xnthread {
 
 	struct xnthread_personality *personality;
 
+	struct completion exited;
+
 #ifdef CONFIG_XENO_OPT_DEBUG
 	const char *exe_path;	/* Executable path */
 	u32 proghash;		/* Hash value for exe_path */
 #endif
-	/** Exit event for joining the thread. */
-	struct xnsynch join_synch;
 };
 
 static inline int xnthread_get_state(const struct xnthread *thread)
@@ -267,7 +265,7 @@ static inline pid_t xnthread_host_pid(struct xnthread *thread)
 	if (xnthread_test_state(thread, XNROOT))
 		return 0;
 
-	return xnthread_host_task(thread)->pid;
+	return task_pid_nr(xnthread_host_task(thread));
 }
 
 #define xnthread_for_each_claimed(__pos, __thread)		\

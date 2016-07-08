@@ -272,41 +272,61 @@ static int register_driver(struct rtdm_driver *drv)
 		return 0;
 	}
 
-	if (drv->profile_info.magic != ~RTDM_CLASS_MAGIC)
+	if (drv->profile_info.magic != ~RTDM_CLASS_MAGIC) {
+		XENO_WARN_ON_ONCE(COBALT, 1);
 		return -EINVAL;
+	}
 
 	switch (drv->device_flags & RTDM_DEVICE_TYPE_MASK) {
 	case RTDM_NAMED_DEVICE:
 	case RTDM_PROTOCOL_DEVICE:
 		break;
 	default:
+		printk(XENO_WARNING "%s has invalid device type (%#x)\n",
+		       drv->profile_info.name,
+		       drv->device_flags & RTDM_DEVICE_TYPE_MASK);
 		return -EINVAL;
 	}
 
-	if (drv->device_count <= 0)
+	if (drv->device_count <= 0 ||
+	    drv->device_count > RTDM_MAX_MINOR) {
+		printk(XENO_WARNING "%s has invalid device count (%d)\n",
+		       drv->profile_info.name, drv->device_count);
 		return -EINVAL;
+	}
 
 	if ((drv->device_flags & RTDM_NAMED_DEVICE) == 0)
 		goto done;
 
-	ret = alloc_chrdev_region(&rdev, 0, drv->device_count,
+	if (drv->base_minor < 0 ||
+	    drv->base_minor >= RTDM_MAX_MINOR) {
+		printk(XENO_WARNING "%s has invalid base minor (%d)\n",
+		       drv->profile_info.name, drv->base_minor);
+		return -EINVAL;
+	}
+
+	ret = alloc_chrdev_region(&rdev, drv->base_minor, drv->device_count,
 				  drv->profile_info.name);
 	if (ret) {
-		printk(XENO_WARNING "cannot allocate chrdev region %s[0..%d]\n",
-		       drv->profile_info.name, drv->device_count - 1);
+		printk(XENO_WARNING "cannot allocate chrdev region %s[%d..%d]\n",
+		       drv->profile_info.name, drv->base_minor,
+		       drv->base_minor + drv->device_count - 1);
 		return ret;
 	}
 
 	cdev_init(&drv->named.cdev, &rtdm_dumb_fops);
 	ret = cdev_add(&drv->named.cdev, rdev, drv->device_count);
-	if (ret)
+	if (ret) {
+		printk(XENO_WARNING "cannot create cdev series for %s\n",
+		       drv->profile_info.name);
 		goto fail_cdev;
+	}
 
 	drv->named.major = MAJOR(rdev);
-	atomic_set(&drv->refcount, 1);
 	bitmap_zero(drv->minor_map, RTDM_MAX_MINOR);
 
 done:
+	atomic_set(&drv->refcount, 1);
 	drv->nb_statechange.notifier_call = state_change_notifier;
 	drv->nb_statechange.priority = 0;
 	cobalt_add_state_chain(&drv->nb_statechange);
@@ -324,11 +344,16 @@ static void unregister_driver(struct rtdm_driver *drv)
 {
 	XENO_BUG_ON(COBALT, drv->profile_info.magic != RTDM_CLASS_MAGIC);
 
+	if (!atomic_dec_and_test(&drv->refcount))
+		return;
+
 	cobalt_remove_state_chain(&drv->nb_statechange);
-	
+
+	drv->profile_info.magic = ~RTDM_CLASS_MAGIC;
+
 	if (drv->device_flags & RTDM_NAMED_DEVICE) {
 		cdev_del(&drv->named.cdev);
-		unregister_chrdev_region(MKDEV(drv->named.major, 0),
+		unregister_chrdev_region(MKDEV(drv->named.major, drv->base_minor),
 					 drv->device_count);
 	}
 }
@@ -352,10 +377,14 @@ static void unregister_driver(struct rtdm_driver *drv)
  * - -ENOMEM is returned if a memory allocation failed in the process
  * of registering the device.
  *
+ * - -EAGAIN is returned if no registry slot is available (check/raise
+ * CONFIG_XENO_OPT_REGISTRY_NRSLOTS).
+ *
  * @coretags{secondary-only}
  */
 int rtdm_dev_register(struct rtdm_device *dev)
 {
+	struct class *kdev_class = rtdm_class;
 	struct device *kdev = NULL;
 	struct rtdm_driver *drv;
 	int ret, major, minor;
@@ -387,10 +416,14 @@ int rtdm_dev_register(struct rtdm_device *dev)
 	dev->ops.close = __rtdm_dev_close; /* Interpose on driver's handler. */
 	atomic_set(&dev->refcount, 0);
 
+	if (drv->profile_info.kdev_class)
+		kdev_class = drv->profile_info.kdev_class;
+
 	if (drv->device_flags & RTDM_NAMED_DEVICE) {
 		if (drv->device_flags & RTDM_FIXED_MINOR) {
 			minor = dev->minor;
-			if (minor < 0 || minor >= drv->device_count) {
+			if (minor < 0 ||
+			    minor >= drv->base_minor + drv->device_count) {
 				ret = -ENXIO;
 				goto fail;
 			}
@@ -416,8 +449,8 @@ int rtdm_dev_register(struct rtdm_device *dev)
 			goto fail;
 
 		rdev = MKDEV(major, minor);
-		kdev = device_create(rtdm_class, NULL, rdev,
-				     dev, dev->label, minor);
+		kdev = device_create(kdev_class, NULL, rdev,
+				     dev, kbasename(dev->label), minor);
 		if (IS_ERR(kdev)) {
 			xnregistry_remove(dev->named.handle);
 			ret = PTR_ERR(kdev);
@@ -440,7 +473,7 @@ int rtdm_dev_register(struct rtdm_device *dev)
 		}
 
 		rdev = MKDEV(0, minor);
-		kdev = device_create(rtdm_class, NULL, rdev,
+		kdev = device_create(kdev_class, NULL, rdev,
 				     dev, dev->name);
 		if (IS_ERR(kdev)) {
 			ret = PTR_ERR(kdev);
@@ -457,6 +490,7 @@ int rtdm_dev_register(struct rtdm_device *dev)
 	dev->rdev = rdev;
 	dev->kdev = kdev;
 	dev->magic = RTDM_DEVICE_MAGIC;
+	dev->kdev_class = kdev_class;
 
 	mutex_unlock(&register_lock);
 
@@ -465,10 +499,9 @@ int rtdm_dev_register(struct rtdm_device *dev)
 	return 0;
 fail:
 	if (kdev)
-		device_destroy(rtdm_class, rdev);
+		device_destroy(kdev_class, rdev);
 
-	if (atomic_dec_and_test(&drv->refcount))
-		unregister_driver(drv);
+	unregister_driver(drv);
 
 	mutex_unlock(&register_lock);
 
@@ -514,7 +547,7 @@ void rtdm_dev_unregister(struct rtdm_device *dev)
 		__clear_bit(dev->minor, protocol_devices_minor_map);
 	}
 
-	device_destroy(rtdm_class, dev->rdev);
+	device_destroy(dev->kdev_class, dev->rdev);
 
 	unregister_driver(drv);
 
@@ -523,6 +556,50 @@ void rtdm_dev_unregister(struct rtdm_device *dev)
 	kfree(dev->name);
 }
 EXPORT_SYMBOL_GPL(rtdm_dev_unregister);
+
+/**
+ * @brief Set the kernel device class of a RTDM driver.
+ *
+ * Set the kernel device class assigned to the RTDM driver. By
+ * default, RTDM drivers belong to Linux's "rtdm" device class,
+ * creating a device node hierarchy rooted at /dev/rtdm, and sysfs
+ * nodes under /sys/class/rtdm.
+ *
+ * This call assigns a user-defined kernel device class to the RTDM
+ * driver, so that its devices are created into a different system
+ * hierarchy.
+ *
+ * rtdm_drv_set_sysclass() is meaningful only before the first device
+ * which is attached to @a drv is registered by a call to
+ * rtdm_dev_register().
+ *
+ * @param[in] drv Address of the RTDM driver descriptor.
+ *
+ * @param[in] cls Pointer to the kernel device class.
+ *
+ * @return 0 on success, otherwise:
+ *
+ * - -EBUSY is returned if the kernel device class has already been
+ * set for @a drv, or some device(s) attached to @a drv are currently
+ * registered.
+ *
+ * @coretags{task-unrestricted}
+ *
+ * @attention The kernel device class set by this call is not related to
+ * the RTDM class identification as defined by the @ref rtdm_profiles
+ * "RTDM profiles" in any way. This is strictly related to the Linux
+ * kernel device hierarchy.
+ */
+int rtdm_drv_set_sysclass(struct rtdm_driver *drv, struct class *cls)
+{
+	if (drv->profile_info.kdev_class || atomic_read(&drv->refcount))
+		return -EBUSY;
+
+	drv->profile_info.kdev_class = cls;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rtdm_drv_set_sysclass);
 
 /** @} */
 

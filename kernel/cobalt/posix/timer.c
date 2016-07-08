@@ -268,16 +268,14 @@ out:
 void __cobalt_timer_getval(struct xntimer *__restrict__ timer,
 			   struct itimerspec *__restrict__ value)
 {
+	ns2ts(&value->it_interval, xntimer_interval(timer));
+
 	if (!xntimer_running_p(timer)) {
 		value->it_value.tv_sec = 0;
 		value->it_value.tv_nsec = 0;
-		value->it_interval.tv_sec = 0;
-		value->it_interval.tv_nsec = 0;
-		return;
+	} else {
+		ns2ts(&value->it_value, xntimer_get_timeout(timer));
 	}
-
-	ns2ts(&value->it_value, xntimer_get_timeout(timer));
-	ns2ts(&value->it_interval, xntimer_interval(timer));
 }
 
 static inline void
@@ -286,17 +284,11 @@ timer_gettimeout(struct cobalt_timer *__restrict__ timer,
 {
 	int ret = 0;
 
-	if (!xntimer_running_p(&timer->timerbase)) {
-		value->it_value.tv_sec = 0;
-		value->it_value.tv_nsec = 0;
-		value->it_interval.tv_sec = 0;
-		value->it_interval.tv_nsec = 0;
+	if (cobalt_call_extension(timer_gettime, &timer->extref,
+				  ret, value) && ret != 0)
 		return;
-	}
 
-	if (!cobalt_call_extension(timer_gettime, &timer->extref,
-				   ret, value) || ret == 0)
-		__cobalt_timer_getval(&timer->timerbase, value);
+	__cobalt_timer_getval(&timer->timerbase, value);
 }
 
 int __cobalt_timer_setval(struct xntimer *__restrict__ timer, int clock_flag,

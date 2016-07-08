@@ -23,6 +23,7 @@
 #include <linux/kthread.h>
 #include <linux/wait.h>
 #include <linux/signal.h>
+#include <linux/pid.h>
 #include <cobalt/kernel/sched.h>
 #include <cobalt/kernel/timer.h>
 #include <cobalt/kernel/synch.h>
@@ -40,15 +41,13 @@
 #include <asm-generic/xenomai/mayday.h>
 #include "debug.h"
 
+static DECLARE_WAIT_QUEUE_HEAD(join_all);
+
 /**
  * @ingroup cobalt_core
  * @defgroup cobalt_core_thread Thread services
  * @{
  */
-
-static DECLARE_WAIT_QUEUE_HEAD(nkjoinq);
-
-static unsigned int idtags;
 
 static void timeout_handler(struct xntimer *timer)
 {
@@ -86,6 +85,13 @@ static void periodic_handler(struct xntimer *timer)
 		xnthread_resume(thread, XNDELAY);
 
 	fixup_ptimer_affinity(thread);
+}
+
+static inline void enlist_new_thread(struct xnthread *thread)
+{				/* nklock held, irqs off */
+	list_add_tail(&thread->glink, &nkthreadq);
+	cobalt_nrthreads++;
+	xnvfile_touch_tag(&nkthreadlist_tag);
 }
 
 struct kthread_arg {
@@ -158,20 +164,13 @@ int __xnthread_init(struct xnthread *thread,
 		    const union xnsched_policy_param *sched_param)
 {
 	int flags = attr->flags, ret, gravity;
-	spl_t s;
 
 	flags &= ~XNSUSP;
 #ifndef CONFIG_XENO_ARCH_FPU
 	flags &= ~XNFPU;
 #endif
-	if (flags & XNROOT)
-		thread->idtag = 0;
-	else {
-		xnlock_get_irqsave(&nklock, s);
-		thread->idtag = ++idtags ?: 1;
-		xnlock_put_irqrestore(&nklock, s);
+	if ((flags & XNROOT) == 0)
 		flags |= XNDORMANT;
-	}
 
 	if (attr->name)
 		ksformat(thread->name,
@@ -204,12 +203,14 @@ int __xnthread_init(struct xnthread *thread,
 	memset(&thread->stat, 0, sizeof(thread->stat));
 	thread->selector = NULL;
 	INIT_LIST_HEAD(&thread->claimq);
-	xnsynch_init(&thread->join_synch, XNSYNCH_FIFO, NULL);
 	/* These will be filled by xnthread_start() */
 	thread->entry = NULL;
 	thread->cookie = NULL;
+	init_completion(&thread->exited);
 
 	gravity = flags & XNUSER ? XNTIMER_UGRAVITY : XNTIMER_KGRAVITY;
+	if (flags & XNROOT)
+		gravity |= __XNTIMER_CORE;
 	xntimer_init(&thread->rtimer, &nkclock, timeout_handler,
 		     sched, gravity);
 	xntimer_set_name(&thread->rtimer, thread->name);
@@ -485,8 +486,6 @@ static inline void cleanup_tcb(struct xnthread *thread) /* nklock held, irqs off
 		xnthread_clear_state(thread, XNREADY);
 	}
 
-	thread->idtag = 0;
-
 	if (xnthread_test_state(thread, XNPEND))
 		xnsynch_forget_sleeper(thread);
 
@@ -526,10 +525,15 @@ void __xnthread_cleanup(struct xnthread *curr)
 	cleanup_tcb(curr);
 	xnlock_put_irqrestore(&nklock, s);
 
+	/* Wake up the joiner if any (we can't have more than one). */
+	complete(&curr->exited);
+
+	/* Notify our exit to xnthread_killall() if need be. */
+	if (waitqueue_active(&join_all))
+		wake_up(&join_all);
+
 	/* Finalize last since this incurs releasing the TCB. */
 	xnthread_run_handler_stack(curr, finalize_thread);
-
-	wake_up(&nkjoinq);
 }
 
 /*
@@ -560,10 +564,10 @@ void __xnthread_discard(struct xnthread *thread)
  * Initializes a new thread. The thread is left dormant until it is
  * actually started by xnthread_start().
  *
- * @param thread The address of a thread descriptor the nucleus will
- * use to store the thread-specific data.  This descriptor must always
- * be valid while the thread is active therefore it must be allocated
- * in permanent memory. @warning Some architectures may require the
+ * @param thread The address of a thread descriptor Cobalt will use to
+ * store the thread-specific data.  This descriptor must always be
+ * valid while the thread is active therefore it must be allocated in
+ * permanent memory. @warning Some architectures may require the
  * descriptor to be properly aligned in memory; this is an additional
  * reason for descriptors not to be laid in the program stack where
  * alignement constraints might not always be satisfied.
@@ -574,14 +578,13 @@ void __xnthread_discard(struct xnthread *thread)
  *
  * - name: An ASCII string standing for the symbolic name of the
  * thread. This name is copied to a safe place into the thread
- * descriptor. This name might be used in various situations by the
- * nucleus for issuing human-readable diagnostic messages, so it is
- * usually a good idea to provide a sensible value here.  NULL is fine
- * though and means "anonymous".
+ * descriptor. This name might be used in various situations by Cobalt
+ * for issuing human-readable diagnostic messages, so it is usually a
+ * good idea to provide a sensible value here.  NULL is fine though
+ * and means "anonymous".
  *
  * - flags: A set of creation flags affecting the operation. The
- * following flags can be part of this bitmask, each of them affecting
- * the nucleus behaviour regarding the created thread:
+ * following flags can be part of this bitmask:
  *
  *   - XNSUSP creates the thread in a suspended state. In such a case,
  * the thread shall be explicitly resumed using the xnthread_resume()
@@ -593,8 +596,8 @@ void __xnthread_discard(struct xnthread *thread)
  * user-space task. Otherwise, a new kernel host task is created, then
  * paired with the new Xenomai thread.
  *
- * - XNFPU (enable FPU) tells the nucleus that the new thread may use
- * the floating-point unit. XNFPU is implicitly assumed for user-space
+ * - XNFPU (enable FPU) tells Cobalt that the new thread may use the
+ * floating-point unit. XNFPU is implicitly assumed for user-space
  * threads even if not set in @a flags.
  *
  * - affinity: The processor affinity of this thread. Passing
@@ -623,7 +626,6 @@ int xnthread_init(struct xnthread *thread,
 {
 	struct xnsched *sched;
 	cpumask_t affinity;
-	spl_t s;
 	int ret;
 
 	if (attr->flags & ~(XNFPU | XNUSER | XNSUSP))
@@ -646,12 +648,6 @@ int xnthread_init(struct xnthread *thread,
 
 	trace_cobalt_thread_init(thread, attr, sched_class);
 
-	xnlock_get_irqsave(&nklock, s);
-	list_add_tail(&thread->glink, &nkthreadq);
-	cobalt_nrthreads++;
-	xnvfile_touch_tag(&nkthreadlist_tag);
-	xnlock_put_irqrestore(&nklock, s);
-
 	return 0;
 }
 EXPORT_SYMBOL_GPL(xnthread_init);
@@ -671,9 +667,8 @@ EXPORT_SYMBOL_GPL(xnthread_init);
  * execution properties of the new thread. Members of this structure
  * are defined as follows:
  *
- * - mode: The initial thread mode. The following flags can
- * be part of this bitmask, each of them affecting the nucleus
- * behaviour regarding the started thread:
+ * - mode: The initial thread mode. The following flags can be part of
+ * this bitmask:
  *
  *   - XNLOCK causes the thread to lock the scheduler when it starts.
  * The target thread will have to call the xnsched_unlock()
@@ -688,7 +683,7 @@ EXPORT_SYMBOL_GPL(xnthread_init);
  * - entry: The address of the thread's body routine. In other words,
  * it is the thread entry point.
  *
- * - cookie: A user-defined opaque cookie the nucleus will pass to the
+ * - cookie: A user-defined opaque cookie Cobalt will pass to the
  * emerging thread as the sole argument of its entry point.
  *
  * @retval 0 if @a thread could be started ;
@@ -714,6 +709,14 @@ int xnthread_start(struct xnthread *thread,
 	thread->cookie = attr->cookie;
 	if (attr->mode & XNLOCK)
 		thread->lock_count = 1;
+
+	/*
+	 * A user-space thread starts immediately Cobalt-wise since we
+	 * already have an underlying Linux context for it, so we can
+	 * enlist it now to make it visible from the /proc interface.
+	 */
+	if (xnthread_test_state(thread, XNUSER))
+		enlist_new_thread(thread);
 
 	trace_cobalt_thread_start(thread);
 
@@ -987,20 +990,20 @@ void xnthread_suspend(struct xnthread *thread, int mask,
 	 * current thread.
 	 *
 	 *  The net effect is that we are attempting to stop the
-	 * shadow thread at the nucleus level, whilst this thread is
-	 * actually running some code under the control of the Linux
-	 * scheduler (i.e. it's relaxed).
+	 * shadow thread for Cobalt, whilst this thread is actually
+	 * running some code under the control of the Linux scheduler
+	 * (i.e. it's relaxed).
 	 *
 	 *  To make this possible, we force the target Linux task to
 	 * migrate back to the Xenomai domain by sending it a
 	 * SIGSHADOW signal the interface libraries trap for this
 	 * specific internal purpose, whose handler is expected to
-	 * call back the nucleus's migration service.
+	 * call back Cobalt's migration service.
 	 *
-	 * By forcing this migration, we make sure that the real-time
-	 * nucleus controls, hence properly stops, the target thread
-	 * according to the requested suspension condition. Otherwise,
-	 * the shadow thread in secondary mode would just keep running
+	 * By forcing this migration, we make sure that Cobalt
+	 * controls, hence properly stops, the target thread according
+	 * to the requested suspension condition. Otherwise, the
+	 * shadow thread in secondary mode would just keep running
 	 * into the Linux domain, thus breaking the most common
 	 * assumptions regarding suspended threads.
 	 *
@@ -1566,22 +1569,63 @@ check_self_cancel:
 		return;
 	}
 
-	__xnthread_demote(thread);
-
 	/*
-	 * A userland thread undergoing the weak scheduling policy is
-	 * unlikely to issue Cobalt syscalls frequently, which may
-	 * defer cancellation significantly: send it a regular
-	 * termination signal too.
+	 * Force the non-current thread to exit:
+	 *
+	 * - unblock a user thread, switch it to weak scheduling,
+	 * then send it SIGTERM.
+	 *
+	 * - just unblock a kernel thread, it is expected to reach a
+	 * cancellation point soon after
+	 * (i.e. xnthread_test_cancel()).
 	 */
-	if (xnthread_test_state(thread, XNWEAK|XNUSER) == (XNWEAK|XNUSER))
+	if (xnthread_test_state(thread, XNUSER)) {
+		__xnthread_demote(thread);
 		xnthread_signal(thread, SIGTERM, 0);
+	} else
+		__xnthread_kick(thread);
 out:
 	xnlock_put_irqrestore(&nklock, s);
 
 	xnsched_run();
 }
 EXPORT_SYMBOL_GPL(xnthread_cancel);
+
+struct wait_grace_struct {
+	struct completion done;
+	struct rcu_head rcu;
+};
+
+static void grace_elapsed(struct rcu_head *head)
+{
+	struct wait_grace_struct *wgs;
+
+	wgs = container_of(head, struct wait_grace_struct, rcu);
+	complete(&wgs->done);
+}
+
+static void wait_for_rcu_grace_period(struct pid *pid)
+{
+	struct wait_grace_struct wait = {
+		.done = COMPLETION_INITIALIZER_ONSTACK(wait.done),
+	};
+	struct task_struct *p;
+
+	init_rcu_head_on_stack(&wait.rcu);
+	
+	for (;;) {
+		call_rcu(&wait.rcu, grace_elapsed);
+		wait_for_completion(&wait.done);
+		if (pid == NULL)
+			break;
+		rcu_read_lock();
+		p = pid_task(pid, PIDTYPE_PID);
+		rcu_read_unlock();
+		if (p == NULL)
+			break;
+		reinit_completion(&wait.done);
+	}
+}
 
 /**
  * @fn void xnthread_join(struct xnthread *thread, bool uninterruptible)
@@ -1593,12 +1637,14 @@ EXPORT_SYMBOL_GPL(xnthread_cancel);
  * immediately.
  *
  * xnthread_join() adapts to the calling context (primary or
- * secondary).
+ * secondary), switching to secondary mode if needed for the duration
+ * of the wait. Upon return, the original runtime mode is restored,
+ * unless a Linux signal is pending.
  *
  * @param thread The descriptor address of the thread to join with.
  *
  * @param uninterruptible Boolean telling whether the service should
- * wait for completion uninterruptible if called from secondary mode.
+ * wait for completion uninterruptible.
  *
  * @return 0 is returned on success. Otherwise, the following error
  * codes indicate the cause of the failure:
@@ -1616,62 +1662,102 @@ EXPORT_SYMBOL_GPL(xnthread_cancel);
  */
 int xnthread_join(struct xnthread *thread, bool uninterruptible)
 {
-	unsigned int tag;
+	struct xnthread *curr = xnthread_current();
+	int ret = 0, switched = 0;
+	struct pid *pid;
+	pid_t tpid;
 	spl_t s;
-	int ret;
 
 	XENO_BUG_ON(COBALT, xnthread_test_state(thread, XNROOT));
 
+	if (thread == curr)
+		return -EDEADLK;
+
 	xnlock_get_irqsave(&nklock, s);
 
-	tag = thread->idtag;
-	if (xnthread_test_info(thread, XNDORMANT) || tag == 0) {
-		xnlock_put_irqrestore(&nklock, s);
-		return 0;
+	if (xnthread_test_state(thread, XNJOINED)) {
+		ret = -EBUSY;
+		goto out;
 	}
+
+	if (xnthread_test_info(thread, XNDORMANT))
+		goto out;
 
 	trace_cobalt_thread_join(thread);
 
-	if (ipipe_root_p) {
-		if (xnthread_test_state(thread, XNJOINED)) {
-			ret = -EBUSY;
-			goto out;
-		}
-		xnthread_set_state(thread, XNJOINED);
+	xnthread_set_state(thread, XNJOINED);
+	tpid = xnthread_host_pid(thread);
+	
+	if (curr && !xnthread_test_state(curr, XNRELAX)) {
 		xnlock_put_irqrestore(&nklock, s);
-		/*
-		 * Only a very few threads are likely to terminate within a
-		 * short time frame at any point in time, so experiencing a
-		 * thundering herd effect due to synchronizing on a single
-		 * wait queue is quite unlikely. In any case, we run in
-		 * secondary mode.
-		 */
-		if (uninterruptible)
-			wait_event(nkjoinq, thread->idtag != tag);
-		else if (wait_event_interruptible(nkjoinq,
-						  thread->idtag != tag)) {
-			xnlock_get_irqsave(&nklock, s);
-			if (thread->idtag == tag)
-				xnthread_clear_state(thread, XNJOINED);
-			ret = -EINTR;
-			goto out;
-		}
+		xnthread_relax(0, 0);
+		switched = 1;
+	} else
+		xnlock_put_irqrestore(&nklock, s);
 
-		return 0;
-	}
+	/*
+	 * Since in theory, we might be sleeping there for a long
+	 * time, we get a reference on the pid struct holding our
+	 * target, then we check for its existence upon wake up.
+	 */
+	pid = find_get_pid(tpid);
+	if (pid == NULL)
+		goto done;
 
-	if (thread == xnthread_current())
-		ret = -EDEADLK;
-	else if (xnsynch_pended_p(&thread->join_synch))
-		ret = -EBUSY;
+	/*
+	 * We have a tricky issue to deal with, which involves code
+	 * relying on the assumption that a destroyed thread will have
+	 * scheduled away from do_exit() before xnthread_join()
+	 * returns. A typical example is illustrated by the following
+	 * sequence, with a RTDM kernel task implemented in a
+	 * dynamically loaded module:
+	 *
+	 * CPU0:  rtdm_task_destroy(ktask)
+	 *           xnthread_cancel(ktask)
+	 *           xnthread_join(ktask)
+	 *        ...<back to user>..
+	 *        rmmod(module)
+	 *
+	 * CPU1:  in ktask()
+	 *        ...
+	 *        ...
+	 *          __xnthread_test_cancel()
+	 *             do_exit()
+         *                schedule()
+	 *
+	 * In such a sequence, the code on CPU0 would expect the RTDM
+	 * task to have scheduled away upon return from
+	 * rtdm_task_destroy(), so that unmapping the destroyed task
+	 * code and data memory when unloading the module is always
+	 * safe.
+	 *
+	 * To address this, the joiner first waits for the joinee to
+	 * signal completion from the Cobalt thread cleanup handler
+	 * (__xnthread_cleanup), then waits for a full RCU grace
+	 * period to have elapsed. Since the completion signal is sent
+	 * on behalf of do_exit(), we may assume that the joinee has
+	 * scheduled away before the RCU grace period ends.
+	 */
+	if (uninterruptible)
+		wait_for_completion(&thread->exited);
 	else {
-		xnthread_set_state(thread, XNJOINED);
-		ret = xnsynch_sleep_on(&thread->join_synch,
-				       XN_INFINITE, XN_RELATIVE);
-		if ((ret & XNRMID) == 0 && thread->idtag == tag)
-			xnthread_clear_state(thread, XNJOINED);
-		ret = ret & XNBREAK ? -EINTR : 0;
+		ret = wait_for_completion_interruptible(&thread->exited);
+		if (ret < 0) {
+			put_pid(pid);
+			return -EINTR;
+		}
 	}
+
+	/* Make sure the joinee has scheduled away ultimately. */
+	wait_for_rcu_grace_period(pid);
+
+	put_pid(pid);
+done:
+	ret = 0;
+	if (switched)
+		ret = xnthread_harden();
+
+	return ret;
 out:
 	xnlock_put_irqrestore(&nklock, s);
 
@@ -1782,10 +1868,10 @@ void xnthread_migrate_passive(struct xnthread *thread, struct xnsched *sched)
  *
  * Changes the base scheduling policy and paramaters of a thread. If
  * the thread is currently blocked, waiting in priority-pending mode
- * (XNSYNCH_PRIO) for a synchronization object to be signaled, the
- * nucleus will attempt to reorder the object's wait queue so that it
- * reflects the new sleeper's priority, unless the XNSYNCH_DREORD flag
- * has been set for the pended object.
+ * (XNSYNCH_PRIO) for a synchronization object to be signaled, Cobalt
+ * will attempt to reorder the object's wait queue so that it reflects
+ * the new sleeper's priority, unless the XNSYNCH_DREORD flag has been
+ * set for the pended object.
  *
  * @param thread The descriptor address of the affected thread. See
  * note.
@@ -2413,8 +2499,8 @@ static inline void init_kthread_info(struct xnthread *thread)
  * @internal
  * @brief Create a shadow thread context over a kernel task.
  *
- * This call maps a nucleus thread to the "current" Linux task running
- * in kernel space.  The priority and scheduling class of the
+ * This call maps a Cobalt core thread to the "current" Linux task
+ * running in kernel space.  The priority and scheduling class of the
  * underlying Linux task are not affected; it is assumed that the
  * caller did set them appropriately before issuing the shadow mapping
  * request.
@@ -2493,7 +2579,10 @@ int xnthread_map(struct xnthread *thread, struct completion *done)
 	xnthread_resume(thread, XNDORMANT);
 	ret = xnthread_harden();
 	wakeup_parent(done);
+
 	xnlock_get_irqsave(&nklock, s);
+
+	enlist_new_thread(thread);
 	/*
 	 * Make sure xnthread_start() did not slip in from another CPU
 	 * while we were back from wakeup_parent().
@@ -2501,6 +2590,7 @@ int xnthread_map(struct xnthread *thread, struct completion *done)
 	if (thread->entry == NULL)
 		xnthread_suspend(thread, XNDORMANT,
 				 XN_INFINITE, XN_RELATIVE, NULL);
+
 	xnlock_put_irqrestore(&nklock, s);
 
 	xnthread_test_cancel();
@@ -2558,10 +2648,10 @@ int xnthread_killall(int grace, int mask)
 	xnlock_put_irqrestore(&nklock, s);
 
 	/*
-	 * Cancel then join all existing user threads during the grace
+	 * Cancel then join all existing threads during the grace
 	 * period. It is the caller's responsibility to prevent more
-	 * user threads to bind to the system if required, we won't
-	 * make any provision for this here.
+	 * threads to bind to the system if required, we won't make
+	 * any provision for this here.
 	 */
 	count = nrthreads - nrkilled;
 	if (XENO_DEBUG(COBALT))
@@ -2569,14 +2659,17 @@ int xnthread_killall(int grace, int mask)
 		       nrkilled);
 
 	if (grace > 0) {
-		ret = wait_event_interruptible_timeout(nkjoinq,
+		ret = wait_event_interruptible_timeout(join_all,
 						       cobalt_nrthreads == count,
 						       grace * HZ);
 		if (ret == 0)
 			return -EAGAIN;
 	} else
-		ret = wait_event_interruptible(nkjoinq,
+		ret = wait_event_interruptible(join_all,
 					       cobalt_nrthreads == count);
+
+	/* Wait for a full RCU grace period to expire. */
+	wait_for_rcu_grace_period(NULL);
 
 	if (XENO_DEBUG(COBALT))
 		printk(XENO_INFO "joined %d threads\n",

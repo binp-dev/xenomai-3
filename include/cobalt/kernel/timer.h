@@ -51,10 +51,12 @@ typedef enum xntmode {
 #define XNTIMER_RUNNING   0x00000040
 #define XNTIMER_KGRAVITY  0x00000080
 #define XNTIMER_UGRAVITY  0x00000100
-#define XNTIMER_IGRAVITY  0	/* most conservative */
+#define XNTIMER_IGRAVITY  0	     /* most conservative */
 
 #define XNTIMER_GRAVITY_MASK	(XNTIMER_KGRAVITY|XNTIMER_UGRAVITY)
 #define XNTIMER_INIT_MASK	(XNTIMER_GRAVITY_MASK|XNTIMER_NOBLCK)
+
+#define __XNTIMER_CORE    0x10000000
 
 /* These flags are available to the real-time interfaces */
 #define XNTIMER_SPARE0  0x01000000
@@ -99,15 +101,9 @@ static inline struct xntlholder *xntlist_next(struct list_head *q,
 	return list_entry(h->link.next, struct xntlholder, link);
 }
 
-static inline struct xntlholder *xntlist_second(struct list_head *q)
+static inline struct xntlholder *xntlist_second(struct list_head *q,
+	struct xntlholder *h)
 {
-	struct xntlholder *h;
-
-	if (list_empty(q))
-		return NULL;
-
-	h = list_first_entry(q, struct xntlholder, link);
-
 	return xntlist_next(q, h);
 }
 
@@ -140,35 +136,59 @@ static inline void xntlist_insert(struct list_head *q, struct xntlholder *holder
 		list_del(&(h)->link);		\
 	} while (0)
 
-#if defined(CONFIG_XENO_OPT_TIMER_HEAP)
+#if defined(CONFIG_XENO_OPT_TIMER_RBTREE)
 
-#include <cobalt/kernel/bheap.h>
+#include <linux/rbtree.h>
 
-typedef bheaph_t xntimerh_t;
+typedef struct {
+	unsigned long long date;
+	unsigned prio;
+	struct rb_node link;
+} xntimerh_t;
 
-#define xntimerh_date(h)          bheaph_key(h)
-#define xntimerh_prio(h)          bheaph_prio(h)
-#define xntimerh_init(h)          bheaph_init(h)
+#define xntimerh_date(h) ((h)->date)
+#define xntimerh_prio(h) ((h)->prio)
+#define xntimerh_init(h) do { } while (0)
 
-typedef DECLARE_BHEAP_CONTAINER(xntimerq_t, CONFIG_XENO_OPT_TIMER_HEAP_CAPACITY);
+typedef struct {
+	struct rb_root root;
+	xntimerh_t *head;
+} xntimerq_t;
 
-#define xntimerq_init(q)          bheap_init((q), CONFIG_XENO_OPT_TIMER_HEAP_CAPACITY)
-#define xntimerq_destroy(q)       bheap_destroy(q)
-#define xntimerq_empty(q)         bheap_empty(q)
-#define xntimerq_head(q)          bheap_gethead(q)
-#define xntimerq_second(q)        bheap_second(q)
-#define xntimerq_insert(q, h)     bheap_insert((q),(h))
-#define xntimerq_remove(q, h)     bheap_delete((q),(h))
+#define xntimerq_init(q)			\
+	({					\
+		xntimerq_t *_q = (q);		\
+		_q->root = RB_ROOT;		\
+		_q->head = NULL;		\
+	})
 
-typedef struct {} xntimerq_it_t;
+#define xntimerq_destroy(q) do { } while (0)
+#define xntimerq_empty(q) ((q)->head != NULL)
 
-/*
- * BIG FAT WARNING: the iterator does NOT guarantee any particular
- * order when returning elements (typically, items may be returned in
- * random timestamp order).
- */
-#define xntimerq_it_begin(q, i)   ((void) (i), bheap_gethead(q))
-#define xntimerq_it_next(q, i, h) ((void) (i), bheap_next((q),(h)))
+#define xntimerq_head(q) ((q)->head)
+
+#define xntimerq_next(q, h)						\
+	({								\
+		struct rb_node *_node = rb_next(&(h)->link);		\
+		_node ? (container_of(_node, xntimerh_t, link)) : NULL; \
+	})
+
+#define xntimerq_second(q, h) xntimerq_next(q, h)
+
+void xntimerq_insert(xntimerq_t *q, xntimerh_t *holder);
+
+static inline void xntimerq_remove(xntimerq_t *q, xntimerh_t *holder)
+{
+	if (holder == q->head)
+		q->head = xntimerq_second(q, holder);
+
+	rb_erase(&holder->link, &q->root);
+}
+
+typedef struct { } xntimerq_it_t;
+
+#define xntimerq_it_begin(q,i)	((void) (i), xntimerq_head(q))
+#define xntimerq_it_next(q,i,h) ((void) (i), xntimerq_next((q),(h)))
 
 #else /* CONFIG_XENO_OPT_TIMER_LIST */
 
@@ -184,7 +204,7 @@ typedef struct list_head xntimerq_t;
 #define xntimerq_destroy(q)     do { } while (0)
 #define xntimerq_empty(q)       xntlist_empty(q)
 #define xntimerq_head(q)        xntlist_head(q)
-#define xntimerq_second(q)      xntlist_second(q)
+#define xntimerq_second(q, h)   xntlist_second((q),(h))
 #define xntimerq_insert(q, h)   xntlist_insert((q),(h))
 #define xntimerq_remove(q, h)   xntlist_remove((q),(h))
 
@@ -454,7 +474,7 @@ void __xntimer_stop(struct xntimer *timer);
 
 xnticks_t xntimer_get_date(struct xntimer *timer);
 
-xnticks_t xntimer_get_timeout(struct xntimer *timer);
+xnticks_t __xntimer_get_timeout(struct xntimer *timer);
 
 xnticks_t xntimer_get_interval(struct xntimer *timer);
 
@@ -466,9 +486,17 @@ static inline void xntimer_stop(struct xntimer *timer)
 		__xntimer_stop(timer);
 }
 
+static inline xnticks_t xntimer_get_timeout(struct xntimer *timer)
+{
+	if (!xntimer_running_p(timer))
+		return XN_INFINITE;
+
+	return __xntimer_get_timeout(timer);
+}
+
 static inline xnticks_t xntimer_get_timeout_stopped(struct xntimer *timer)
 {
-	return xntimer_get_timeout(timer);
+	return __xntimer_get_timeout(timer);
 }
 
 static inline void xntimer_enqueue(struct xntimer *timer,

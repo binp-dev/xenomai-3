@@ -326,12 +326,12 @@ fail_syncinit:
 
 /**
  * @fn int rt_task_create(RT_TASK *task, const char *name, int stksize, int prio, int mode)
- * @brief Create a real-time task.
+ * @brief Create a task with Alchemy personality.
  *
- * This service creates a task with access to the full set of Xenomai
- * real-time services. If @a prio is non-zero, the new task belongs to
- * Xenomai's real-time FIFO scheduling class, aka SCHED_FIFO. If @a
- * prio is zero, the task belongs to the regular SCHED_OTHER class.
+ * This service creates a task with access to the full set of Alchemy
+ * services. If @a prio is non-zero, the new task belongs to Xenomai's
+ * real-time FIFO scheduling class, aka SCHED_FIFO. If @a prio is
+ * zero, the task belongs to the regular SCHED_OTHER class.
  *
  * Creating tasks with zero priority is useful for running non
  * real-time processes which may invoke blocking real-time services,
@@ -384,7 +384,7 @@ fail_syncinit:
  * - -EEXIST is returned if the @a name is conflicting with an already
  * registered task.
  *
- * @apitags{thread-unrestricted, switch-secondary}
+ * @apitags{mode-unrestricted, switch-secondary}
  *
  * @sideeffect
  * - When running over the Cobalt core:
@@ -469,7 +469,7 @@ out:
  * when this service is called from asynchronous context, such as a
  * timer/alarm handler.
  *
- * @apitags{thread-unrestricted, switch-secondary}
+ * @apitags{mode-unrestricted, switch-secondary}
  *
  * @note The caller must be an Alchemy task if @a task is NULL.
  */
@@ -525,7 +525,7 @@ int rt_task_delete(RT_TASK *task)
  * - -ESRCH is returned if @a task no longer exists or refers to task
  * created by a different process.
  *
- * @apitags{thread-unrestricted, switch-primary}
+ * @apitags{mode-unrestricted, switch-primary}
  *
  * @note After successful completion of this service, it is neither
  * required nor valid to additionally invoke rt_task_delete() on the
@@ -562,7 +562,7 @@ int rt_task_join(RT_TASK *task)
  * according to any restrictions that may be imposed by the "cpuset"
  * mechanism described in cpuset(7).
  *
- * @apitags{thread-unrestricted, switch-secondary}
+ * @apitags{mode-unrestricted, switch-secondary}
  *
  * @note The caller must be an Alchemy task if @a task is NULL.
  */
@@ -610,7 +610,7 @@ out:
  *
  * - -EINVAL is returned if @a task is not a valid task descriptor.
  *
- * @apitags{thread-unrestricted, switch-primary}
+ * @apitags{mode-unrestricted, switch-primary}
  *
  * @note Starting an already started task leads to a nop, returning a
  * success status.
@@ -650,10 +650,9 @@ out:
  * @fn int rt_task_shadow(RT_TASK *task, const char *name, int prio, int mode)
  * @brief Turn caller into a real-time task.
  *
- * Extends the calling Linux task with Xenomai capabilities, with
- * access to the full set of Xenomai real-time services. This service
- * is typically used for turning the main() thread of an application
- * process into a Xenomai-enabled task.
+ * Set the calling thread personality to the Alchemy API, enabling the
+ * full set of Alchemy services. Upon success, the caller is no more a
+ * regular POSIX thread, but a Xenomai-extended thread.
  *
  * If @a prio is non-zero, the new task moves to Xenomai's real-time
  * FIFO scheduling class, aka SCHED_FIFO. If @a prio is zero, the task
@@ -663,9 +662,6 @@ out:
  * real-time processes which may invoke blocking real-time services,
  * such as pending on a semaphore, reading from a message queue or a
  * buffer, and so on.
- *
- * Once shadowed with the Xenomai extension, the calling task returns
- * and resumes execution normally from the call site.
  *
  * @param task If non-NULL, the address of a task descriptor which can
  * be later used to identify uniquely the task, upon success of this
@@ -702,16 +698,14 @@ out:
  * - -EEXIST is returned if the @a name is conflicting with an already
  * registered task.
  *
- * - -EBUSY is returned if the caller is already mapped to a Xenomai
- * task context.
+ * - -EBUSY is returned if the caller is not a regular POSIX thread.
  *
- * - -EPERM is returned if this service was called from an invalid
- * context.
+ * @apitags{pthread-only, switch-secondary, switch-primary}
  *
- * @apitags{pthread-only, switch-secondary}
- *
- * @sideeffect Over the Cobalt core, the caller always returns from
- * this service in primary mode.
+ * @sideeffect Over Cobalt, if the caller is a plain POSIX thread, it
+ * is turned into a Xenomai _shadow_ thread, with full access to all
+ * Cobalt services. The caller always returns from this service in
+ * primary mode.
  *
  * @note Tasks can be referred to from multiple processes which all
  * belong to the same Xenomai session.
@@ -739,11 +733,28 @@ int rt_task_shadow(RT_TASK *task, const char *name, int prio, int mode)
 	if (current && threadobj_get_magic(current))
 		return -EBUSY;
 
+	/*
+	 * Over Cobalt, the following call turns the current context
+	 * into a dual-kernel thread. Do this early, since this will
+	 * be required next for creating the TCB and running the
+	 * prologue code (i.e. real-time mutexes and monitors are
+	 * locked there).
+	 */
+	self = pthread_self();
+	policy = prio ? SCHED_FIFO : SCHED_OTHER;
+	param_ex.sched_priority = prio;
+	ret = __bt(copperplate_renice_local_thread(self, policy, &param_ex));
+	if (ret)
+		goto out;
+
 	ret = create_tcb(&tcb, task, name, prio, mode);
 	if (ret)
 		goto out;
 
 	CANCEL_RESTORE(svc);
+
+	if (task)
+		task->thread = self;
 
 	ret = threadobj_shadow(&tcb->thobj, tcb->name);
 	if (ret)
@@ -754,14 +765,6 @@ int rt_task_shadow(RT_TASK *task, const char *name, int prio, int mode)
 	ret = task_prologue_2(tcb);
 	if (ret)
 		goto undo;
-
-	self = pthread_self();
-	if (task)
-		task->thread = self;
-
-	policy = prio ? SCHED_FIFO : SCHED_OTHER;
-	param_ex.sched_priority = prio;
-	ret = __bt(copperplate_renice_local_thread(self, policy, &param_ex));
 out:
 	CANCEL_RESTORE(svc);
 
@@ -800,7 +803,7 @@ undo:
  * - -ETIMEDOUT is returned if @a idate is different from TM_INFINITE
  * and represents a date in the past.
  *
- * @apitags{thread-unrestricted, switch-primary}
+ * @apitags{mode-unrestricted, switch-primary}
  *
  * @note The caller must be an Alchemy task if @a task is NULL.
  *
@@ -1036,7 +1039,7 @@ int rt_task_sleep(RTIME delay)
  *
  * @return See rt_task_create().
  *
- * @apitags{thread-unrestricted, switch-secondary}
+ * @apitags{mode-unrestricted, switch-secondary}
  *
  * @sideeffect see rt_task_create().
  */
@@ -1114,7 +1117,7 @@ int rt_task_same(RT_TASK *task1, RT_TASK *task2)
  * - -EPERM is returned if @a task is NULL and this service was called
  * from an invalid context.
  *
- * @apitags{thread-unrestricted, switch-primary}
+ * @apitags{mode-unrestricted, switch-primary}
  *
  * @note The caller must be an Alchemy task if @a task is NULL.
  *
@@ -1240,7 +1243,7 @@ RT_TASK *rt_task_self(void)
  * - -EPERM is returned if @a task is NULL and this service was called
  * from an invalid context.
  *
- * @apitags{thread-unrestricted, switch-primary}
+ * @apitags{mode-unrestricted, switch-primary}
  *
  * @note The caller must be an Alchemy task if @a task is NULL.
  *
@@ -1373,7 +1376,7 @@ out:
  * - -EPERM is returned if @a task is NULL and this service was called
  * from an invalid context.
  *
- * @apitags{thread-unrestricted, switch-primary}
+ * @apitags{mode-unrestricted, switch-primary}
  *
  * @note The caller must be an Alchemy task if @a task is NULL.
  *
@@ -1530,7 +1533,7 @@ out:
  * - -EPERM is returned if @a task is NULL and this service was called
  * from an invalid context.
  *
- * @apitags{thread-unrestricted, switch-primary}
+ * @apitags{mode-unrestricted, switch-primary}
  *
  * @note The caller must be an Alchemy task if @a task is NULL.
  */

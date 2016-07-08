@@ -94,7 +94,7 @@ enum rtdm_selecttype;
 /** @} Device Flags */
 
 /** Maximum number of named devices per driver. */
-#define RTDM_MAX_MINOR	256
+#define RTDM_MAX_MINOR	1024
 
 /** @} rtdm_device_register */
 
@@ -225,6 +225,7 @@ struct rtdm_profile_info {
 	/** Reserved */
 	unsigned int magic;
 	struct module *owner;
+	struct class *kdev_class;
 };
 
 struct rtdm_driver;
@@ -257,7 +258,14 @@ struct rtdm_driver {
 	 * @anchor rtdm_driver_flags
 	 */
 	int device_flags;
-	/** Size of driver defined appendix to struct rtdm_dev_context */
+	/**
+	 * Size of the private memory area the core should
+	 * automatically allocate for each open file descriptor, which
+	 * is usable for storing the context data associated to each
+	 * connection. The allocated memory is zero-initialized. The
+	 * start of this area can be retrieved by a call to
+	 * rtdm_fd_to_private().
+	 */
 	size_t context_size;
 	/** Protocol device identification: protocol family (PF_xxx) */
 	int protocol_family;
@@ -272,6 +280,8 @@ struct rtdm_driver {
 	 * allocate a chrdev region for named devices.
 	 */
 	int device_count;
+	/** Base minor for named devices. */
+	int base_minor;
 	/** Reserved area */
 	struct {
 		union {
@@ -314,7 +324,10 @@ struct rtdm_driver {
 	.version = (__version),					\
 	.magic = ~RTDM_CLASS_MAGIC,				\
 	.owner = THIS_MODULE,					\
+	.kdev_class = NULL,					\
 }
+
+int rtdm_drv_set_sysclass(struct rtdm_driver *drv, struct class *cls);
 
 /**
  * @brief RTDM device
@@ -368,6 +381,7 @@ struct rtdm_device {
 		};
 		dev_t rdev;
 		struct device *kdev;
+		struct class *kdev_class;
 		atomic_t refcount;
 		struct rtdm_fd_ops ops;
 		wait_queue_head_t putwq;
@@ -383,6 +397,11 @@ int rtdm_dev_register(struct rtdm_device *device);
 void rtdm_dev_unregister(struct rtdm_device *device);
 
 #ifndef DOXYGEN_CPP /* Avoid static inline tags for RTDM in doxygen */
+
+static inline struct device *rtdm_dev_to_kdev(struct rtdm_device *device)
+{
+	return device->kdev;
+}
 
 /* --- clock services --- */
 static inline nanosecs_abs_t rtdm_clock_read(void)
@@ -419,9 +438,9 @@ void rtdm_toseq_init(rtdm_toseq_t *timeout_seq, nanosecs_rel_t timeout);
  * respect to all interrupt handlers (including for real-time IRQs)
  * and Xenomai threads running on all CPUs.
  *
- * @param context name of local variable to store the context in. This
- * variable updated by the real-time core will hold the information
- * required to leave the atomic section properly.
+ * @param __context name of local variable to store the context
+ * in. This variable updated by the real-time core will hold the
+ * information required to leave the atomic section properly.
  *
  * @note Atomic sections may be nested. The caller is allowed to sleep
  * on a blocking Xenomai service from primary mode within an atomic
@@ -437,10 +456,10 @@ void rtdm_toseq_init(rtdm_toseq_t *timeout_seq, nanosecs_rel_t timeout);
  * purpose of porting existing dual-kernel drivers which still depend
  * on the obsolete RTDM_EXECUTE_ATOMICALLY() construct.
  */
-#define cobalt_atomic_enter(context)			\
-	do {						\
-		xnlock_get_irqsave(&nklock, (context));	\
-		xnsched_lock();			\
+#define cobalt_atomic_enter(__context)				\
+	do {							\
+		xnlock_get_irqsave(&nklock, (__context));	\
+		xnsched_lock();					\
 	} while (0)
 
 /**
@@ -450,15 +469,15 @@ void rtdm_toseq_init(rtdm_toseq_t *timeout_seq, nanosecs_rel_t timeout);
  * cobalt_atomic_enter(), restoring the preemption and interrupt state
  * which prevailed prior to entering the exited section.
  *
- * @param context name of local variable which stored the context.
+ * @param __context name of local variable which stored the context.
  *
  * @warning This service is not portable to the Mercury core, and
  * should be restricted to Cobalt-specific use cases.
  */
-#define cobalt_atomic_leave(context)				\
+#define cobalt_atomic_leave(__context)				\
 	do {							\
 		xnsched_unlock();				\
-		xnlock_put_irqrestore(&nklock, (context));	\
+		xnlock_put_irqrestore(&nklock, (__context));	\
 	} while (0)
 
 /**
@@ -574,14 +593,16 @@ static inline void rtdm_lock_put(rtdm_lock_t *lock)
 }
 
 /**
- * @fn void rtdm_lock_get_irqsave(rtdm_lock_t *lock, rtdm_lockctx_t context)
  * Acquire lock and disable preemption, by stalling the head domain.
  *
- * @param lock Address of lock variable
- * @param context name of local variable to store the context in
+ * @param __lock Address of lock variable
+ * @param __context name of local variable to store the context in
  *
  * @coretags{unrestricted}
  */
+#define rtdm_lock_get_irqsave(__lock, __context)	\
+	((__context) = __rtdm_lock_get_irqsave(__lock))
+
 static inline rtdm_lockctx_t __rtdm_lock_get_irqsave(rtdm_lock_t *lock)
 {
 	rtdm_lockctx_t context;
@@ -592,8 +613,6 @@ static inline rtdm_lockctx_t __rtdm_lock_get_irqsave(rtdm_lock_t *lock)
 
 	return context;
 }
-#define rtdm_lock_get_irqsave(__lock, __context)	\
-	((__context) = __rtdm_lock_get_irqsave(__lock))
 
 /**
  * Release lock and restore preemption state
@@ -614,22 +633,22 @@ void rtdm_lock_put_irqrestore(rtdm_lock_t *lock, rtdm_lockctx_t context)
 /**
  * Disable preemption locally
  *
- * @param context name of local variable to store the context in
+ * @param __context name of local variable to store the context in
  *
  * @coretags{unrestricted}
  */
-#define rtdm_lock_irqsave(context)	\
-	splhigh(context)
+#define rtdm_lock_irqsave(__context)	\
+	splhigh(__context)
 
 /**
  * Restore preemption state
  *
- * @param context name of local variable which stored the context
+ * @param __context name of local variable which stored the context
  *
  * @coretags{unrestricted}
  */
-#define rtdm_lock_irqrestore(context)	\
-	splexit(context)
+#define rtdm_lock_irqrestore(__context)	\
+	splexit(__context)
 
 /** @} Spinlock with Preemption Deactivation */
 
@@ -1108,6 +1127,31 @@ static inline int __deprecated rtdm_task_sleep_until(nanosecs_abs_t wakeup_time)
 	done:									\
 		__ret;								\
 	})
+
+#define rtdm_wait_context	xnthread_wait_context
+
+static inline
+void rtdm_wait_complete(struct rtdm_wait_context *wc)
+{
+	xnthread_complete_wait(wc);
+}
+
+static inline
+int rtdm_wait_is_completed(struct rtdm_wait_context *wc)
+{
+	return xnthread_wait_complete_p(wc);
+}
+
+static inline void rtdm_wait_prepare(struct rtdm_wait_context *wc)
+{
+	xnthread_prepare_wait(wc);
+}
+
+static inline
+struct rtdm_wait_context *rtdm_wait_get_context(rtdm_task_t *task)
+{
+	return xnthread_get_wait_context(task);
+}
 
 #endif /* !DOXYGEN_CPP */
 

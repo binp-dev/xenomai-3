@@ -55,7 +55,7 @@ int xntimer_heading_p(struct xntimer *timer)
 		return 1;
 
 	if (sched->lflags & XNHDEFER) {
-		h = xntimerq_second(q);
+		h = xntimerq_second(q, h);
 		if (h == &timer->aplink)
 			return 1;
 	}
@@ -266,13 +266,10 @@ EXPORT_SYMBOL_GPL(xntimer_get_date);
  *
  * @coretags{unrestricted, atomic-entry}
  */
-xnticks_t xntimer_get_timeout(struct xntimer *timer)
+xnticks_t __xntimer_get_timeout(struct xntimer *timer)
 {
 	struct xnclock *clock;
 	xnticks_t expiry, now;
-
-	if (!xntimer_running_p(timer))
-		return XN_INFINITE;
 
 	clock = xntimer_clock(timer);
 	now = xnclock_read_raw(clock);
@@ -282,7 +279,7 @@ xnticks_t xntimer_get_timeout(struct xntimer *timer)
 
 	return xnclock_ticks_to_ns(clock, expiry - now);
 }
-EXPORT_SYMBOL_GPL(xntimer_get_timeout);
+EXPORT_SYMBOL_GPL(__xntimer_get_timeout);
 
 /**
  * @fn void xntimer_init(struct xntimer *timer,struct xnclock *clock,void (*handler)(struct xntimer *timer), struct xnsched *sched, int flags)
@@ -363,10 +360,13 @@ void __xntimer_init(struct xntimer *timer,
 		 * clock device on the CPU served by the specified
 		 * scheduler slot. This reveals a CPU affinity
 		 * mismatch between the clock hardware and the client
-		 * code initializing the timer.
+		 * code initializing the timer. This check excludes
+		 * core timers which may have their own reason to bind
+		 * to a passive CPU (e.g. host timer).
 		 */
-		XENO_WARN_ON_SMP(COBALT, !cpumask_test_cpu(xnsched_cpu(sched),
-					       &clock->affinity));
+		XENO_WARN_ON_SMP(COBALT, !(flags & __XNTIMER_CORE) &&
+				 !cpumask_test_cpu(xnsched_cpu(sched),
+						   &clock->affinity));
 		timer->sched = sched;
 	} else {
 		cpu = xnclock_get_default_cpu(clock, 0);
@@ -378,7 +378,7 @@ void __xntimer_init(struct xntimer *timer,
 	timer->tracker = clock;
 #endif
 	ksformat(timer->name, XNOBJECT_NAME_LEN, "%d/%s",
-		 current->pid, current->comm);
+		 task_pid_nr(current), current->comm);
 	xntimer_reset_stats(timer);
 	xnlock_get_irqsave(&nklock, s);
 	list_add_tail(&timer->next_stat, &clock->timerq);
@@ -602,13 +602,15 @@ unsigned long long xntimer_get_overruns(struct xntimer *timer, xnticks_t now)
 		overruns = xnarch_div64(delta, period);
 		timer->pexpect_ticks += overruns;
 
-		q = xntimer_percpu_queue(timer);
-		xntimer_dequeue(timer, q);
-		while (xntimerh_date(&timer->aplink) < now) {
-			timer->periodic_ticks++;
-			xntimer_update_date(timer);
+		if (xntimer_running_p(timer)) {
+			q = xntimer_percpu_queue(timer);
+			xntimer_dequeue(timer, q);
+			while (xntimerh_date(&timer->aplink) < now) {
+				timer->periodic_ticks++;
+				xntimer_update_date(timer);
+			}
+			xntimer_enqueue_and_program(timer, q);
 		}
-		xntimer_enqueue_and_program(timer, q);
 	}
 
 	timer->pexpect_ticks++;
@@ -919,5 +921,37 @@ void xntimer_release_hardware(void)
 #endif /* CONFIG_XENO_OPT_STATS */
 }
 EXPORT_SYMBOL_GPL(xntimer_release_hardware);
+
+#if defined(CONFIG_XENO_OPT_TIMER_RBTREE)
+static inline bool xntimerh_is_lt(xntimerh_t *left, xntimerh_t *right)
+{
+	return left->date < right->date
+		|| (left->date == right->date && left->prio > right->prio);
+}
+
+void xntimerq_insert(xntimerq_t *q, xntimerh_t *holder)
+{
+	struct rb_node **new = &q->root.rb_node, *parent = NULL;
+
+	if (!q->head)
+		q->head = holder;
+	else if (xntimerh_is_lt(holder, q->head)) {
+		parent = &q->head->link;
+		new = &parent->rb_left;
+		q->head = holder;
+	} else while (*new) {
+		xntimerh_t *i = container_of(*new, xntimerh_t, link);
+
+		parent = *new;
+		if (xntimerh_is_lt(holder, i))
+			new = &((*new)->rb_left);
+		else
+			new = &((*new)->rb_right);
+	}
+
+	rb_link_node(&holder->link, parent, new);
+	rb_insert_color(&holder->link, &q->root);
+}
+#endif
 
 /** @} */

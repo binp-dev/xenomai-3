@@ -19,6 +19,7 @@
 #include <stdarg.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
+#include <linux/sched.h>
 #include <cobalt/kernel/select.h>
 #include <rtdm/fd.h>
 #include "internal.h"
@@ -126,7 +127,7 @@ static inline int mq_init(struct cobalt_mq *mq, const struct mq_attr *attr)
 	if (get_order(memsize) > MAX_ORDER)
 		return -ENOSPC;
 
-	mem = alloc_pages_exact(memsize, GFP_KERNEL);
+	mem = xnheap_vmalloc(memsize);
 	if (mem == NULL)
 		return -ENOSPC;
 
@@ -167,7 +168,7 @@ static inline void mq_destroy(struct cobalt_mq *mq)
 	xnselect_destroy(&mq->read_select);
 	xnselect_destroy(&mq->write_select);
 	xnregistry_remove(mq->handle);
-	free_pages_exact(mq->mem, mq->memsize);
+	xnheap_vfree(mq->mem);
 	kfree(mq);
 
 	if (resched)
@@ -713,7 +714,7 @@ mq_notify(struct cobalt_mqd *mqd, unsigned index, const struct sigevent *evp)
 		 * receiver's namespaces. We pass the receiver's creds
 		 * into the init namespace instead.
 		 */
-		mq->si.si_pid = current->pid;
+		mq->si.si_pid = task_pid_nr(current);
 		mq->si.si_uid = get_current_uuid();
 	}
 

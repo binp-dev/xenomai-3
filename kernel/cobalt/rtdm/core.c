@@ -20,6 +20,7 @@
 #include <linux/workqueue.h>
 #include <linux/slab.h>
 #include <linux/file.h>
+#include <linux/sched.h>
 #include <linux/fs.h>
 #include <linux/fdtable.h>
 #include <linux/anon_inodes.h>
@@ -85,7 +86,7 @@ static int create_instance(int ufd, struct rtdm_device *dev,
 	    atomic_read(&dev->refcount) > 1)
 		return -EBUSY;
 
-	context = kmalloc(sizeof(struct rtdm_dev_context) +
+	context = kzalloc(sizeof(struct rtdm_dev_context) +
 			  drv->context_size, GFP_KERNEL);
 	if (unlikely(context == NULL))
 		return -ENOMEM;
@@ -108,7 +109,7 @@ open_devnode(struct rtdm_device *dev, const char *path, int oflag)
 	    strncmp(path, "/dev/rtdm/", 10))
 		printk(XENO_WARNING
 		       "%s[%d] opens obsolete device path: %s\n",
-		       current->comm, current->pid, path);
+		       current->comm, task_pid_nr(current), path);
 
 	filename = kasprintf(GFP_KERNEL, "/dev/rtdm/%s", dev->name);
 	if (filename == NULL)

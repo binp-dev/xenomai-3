@@ -185,7 +185,7 @@ fnref_register(libalchemy, queue_finalize);
  * - -EPERM is returned if this service was called from an
  * asynchronous context.
  *
- * @apitags{thread-unrestricted, switch-secondary}
+ * @apitags{mode-unrestricted, switch-secondary}
  *
  * @note Queues can be shared by multiple processes which belong to
  * the same Xenomai session.
@@ -232,7 +232,7 @@ int rt_queue_create(RT_QUEUE *queue, const char *name,
 	 */
 	if (qlimit == Q_UNLIMITED)
 		ret = heapobj_init(&qcb->hobj, qcb->name,
-				   poolsize + (poolsize / 5));
+				   poolsize + (poolsize * 5 / 100));
 	else
 		ret = heapobj_init_array(&qcb->hobj, qcb->name,
 					 (poolsize / qlimit) *
@@ -304,7 +304,7 @@ fail_cballoc:
  * - -EPERM is returned if this service was called from an
  * asynchronous context.
  *
- * @apitags{thread-unrestricted, switch-secondary}
+ * @apitags{mode-unrestricted, switch-secondary}
  */
 int rt_queue_delete(RT_QUEUE *queue)
 {
@@ -630,10 +630,7 @@ int rt_queue_write(RT_QUEUE *queue,
 	if (mode & ~(Q_URGENT|Q_BROADCAST))
 		return -EINVAL;
 
-	if (size == 0)
-		return 0;
-
-	if (buf == NULL)
+	if (buf == NULL && size > 0)
 		return -EINVAL;
 
 	CANCEL_DEFER(svc);
@@ -683,7 +680,8 @@ enqueue:
 
 	msg->size = size;
 	msg->refcount = 0;
-	memcpy(msg + 1, buf, size);
+	if (size > 0)
+		memcpy(msg + 1, buf, size);
 
 	ret = 0;  /* # of tasks unblocked. */
 	if (nwaiters == 0) {

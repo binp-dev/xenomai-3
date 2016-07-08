@@ -20,12 +20,11 @@
 #include <linux/module.h>
 #include <linux/list.h>
 #include <linux/kernel.h>
-#include <linux/vmalloc.h>
 #include <linux/slab.h>
+#include <linux/poll.h>
 #include <cobalt/kernel/heap.h>
 #include <cobalt/kernel/map.h>
 #include <cobalt/kernel/bufd.h>
-#include <linux/poll.h>
 #include <rtdm/ipc.h>
 #include "internal.h"
 
@@ -139,17 +138,19 @@ static void bufp_close(struct rtdm_fd *fd)
 	rtdm_event_destroy(&sk->i_event);
 	rtdm_event_destroy(&sk->o_event);
 
-	if (sk->name.sipc_port > -1) {
-		cobalt_atomic_enter(s);
-		xnmap_remove(portmap, sk->name.sipc_port);
-		cobalt_atomic_leave(s);
+	if (test_bit(_BUFP_BOUND, &sk->status)) {
+		if (sk->name.sipc_port > -1) {
+			cobalt_atomic_enter(s);
+			xnmap_remove(portmap, sk->name.sipc_port);
+			cobalt_atomic_leave(s);
+		}
+
+		if (sk->handle)
+			xnregistry_remove(sk->handle);
+
+		if (sk->bufmem)
+			xnheap_vfree(sk->bufmem);
 	}
-
-	if (sk->handle)
-		xnregistry_remove(sk->handle);
-
-	if (sk->bufmem)
-		free_pages_exact(sk->bufmem, sk->bufsz);
 
 	kfree(sk);
 }
@@ -423,7 +424,7 @@ static ssize_t __bufp_writebuf(struct bufp_socket *rsk,
 
 	len = bufd->b_len;
 
-	rtdm_toseq_init(&toseq, sk->rx_timeout);
+	rtdm_toseq_init(&toseq, sk->tx_timeout);
 
 	cobalt_atomic_enter(s);
 redo:
@@ -704,7 +705,7 @@ static int __bufp_bind_socket(struct rtipc_private *priv,
 	if (sk->bufsz == 0)
 		return -ENOBUFS;
 
-	sk->bufmem = alloc_pages_exact(sk->bufsz, GFP_KERNEL);
+	sk->bufmem = xnheap_vmalloc(sk->bufsz);
 	if (sk->bufmem == NULL) {
 		ret = -ENOMEM;
 		goto fail;
@@ -719,7 +720,7 @@ static int __bufp_bind_socket(struct rtipc_private *priv,
 		ret = xnregistry_enter(sk->label, sk,
 				       &sk->handle, &__bufp_pnode.node);
 		if (ret) {
-			free_pages_exact(sk->bufmem, sk->bufsz);
+			xnheap_vfree(sk->bufmem);
 			goto fail;
 		}
 	}

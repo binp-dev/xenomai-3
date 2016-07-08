@@ -19,11 +19,11 @@
  */
 #include <linux/module.h>
 #include <linux/string.h>
+#include <linux/poll.h>
 #include <linux/slab.h>
 #include <cobalt/kernel/heap.h>
 #include <cobalt/kernel/bufd.h>
 #include <cobalt/kernel/pipe.h>
-#include <linux/poll.h>
 #include <rtdm/ipc.h>
 #include "internal.h"
 
@@ -184,14 +184,18 @@ static int __xddp_input_handler(struct xnpipe_mh *mh, int retval, void *skarg) /
 {
 	struct xddp_socket *sk = skarg;
 
-	if (sk->monitor == NULL)
-		return retval;
+	if (sk->monitor) {
+		if (retval == 0)
+			/* Callee may alter the return value passed to userland. */
+			retval = sk->monitor(sk->fd, XDDP_EVTIN, xnpipe_m_size(mh));
+		else if (retval == -EPIPE && mh == NULL)
+			sk->monitor(sk->fd, XDDP_EVTDOWN, 0);
+	}
 
-	if (retval == 0)
-		/* Callee may alter the return value passed to userland. */
-		retval = sk->monitor(sk->fd, XDDP_EVTIN, xnpipe_m_size(mh));
-	else if (retval == -EPIPE && mh == NULL)
-		sk->monitor(sk->fd, XDDP_EVTDOWN, 0);
+	if (retval == 0 &&
+	    (__xnpipe_pollstate(sk->minor) & POLLIN) != 0 &&
+	    xnselect_signal(&sk->priv->recv_block, POLLIN))
+		xnsched_run();
 
 	return retval;
 }
@@ -206,7 +210,7 @@ static void __xddp_release_handler(void *skarg) /* nklock free */
 		poolmem = xnheap_get_membase(&sk->privpool);
 		poolsz = xnheap_get_size(&sk->privpool);
 		xnheap_destroy(&sk->privpool);
-		free_pages_exact(poolmem, poolsz);
+		xnheap_vfree(poolmem);
 	} else if (sk->buffer)
 		xnfree(sk->buffer);
 
@@ -577,13 +581,7 @@ nostream:
 		rtdm_fd_unlock(rfd);
 		return ret;
 	}
- done:
-	cobalt_atomic_enter(s);
-	if ((__xnpipe_pollstate(rsk->minor) & POLLIN) != 0 &&
-	    xnselect_signal(&rsk->priv->recv_block, POLLIN))
-		xnsched_run();
-	cobalt_atomic_leave(s);
-
+done:
 	rtdm_fd_unlock(rfd);
 
 	return len;
@@ -691,7 +689,7 @@ static int __xddp_bind_socket(struct rtipc_private *priv,
 	if (poolsz > 0) {
 		poolsz = xnheap_rounded_size(poolsz);
 		poolsz += xnheap_rounded_size(sk->reqbufsz);
-		poolmem = alloc_pages_exact(poolsz, GFP_KERNEL);
+		poolmem = xnheap_vmalloc(poolsz);
 		if (poolmem == NULL) {
 			ret = -ENOMEM;
 			goto fail;
@@ -699,7 +697,7 @@ static int __xddp_bind_socket(struct rtipc_private *priv,
 
 		ret = xnheap_init(&sk->privpool, poolmem, poolsz);
 		if (ret) {
-			free_pages_exact(poolmem, poolsz);
+			xnheap_vfree(poolmem);
 			goto fail;
 		}
 
@@ -732,7 +730,7 @@ static int __xddp_bind_socket(struct rtipc_private *priv,
 	fail_freeheap:
 		if (poolsz > 0) {
 			xnheap_destroy(&sk->privpool);
-			free_pages_exact(poolmem, poolsz);
+			xnheap_vfree(poolmem);
 		}
 	fail:
 		clear_bit(_XDDP_BINDING, &sk->status);

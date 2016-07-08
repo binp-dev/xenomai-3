@@ -19,10 +19,15 @@ if XENOMAI
 source "arch/$SRCARCH/xenomai/Kconfig"
 endif
 
+if MIGRATION
+comment "WARNING! Page migration (CONFIG_MIGRATION) may increase"
+comment "latency."
+endif
+
 if APM || CPU_FREQ || ACPI_PROCESSOR || INTEL_IDLE
-comment "WARNING! You enabled APM, CPU Frequency scaling, ACPI 'processor'"
-comment "or Intel cpuidle option. These options are known to cause troubles"
-comment "with Xenomai, disable them."
+comment "WARNING! At least one of APM, CPU frequency scaling, ACPI 'processor'"
+comment "or CPU idle features is enabled. Any of these options may"
+comment "cause troubles with Xenomai. You should disable them."
 endif
 
 if !GENERIC_CLOCKEVENTS
