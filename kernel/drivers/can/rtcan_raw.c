@@ -974,13 +974,22 @@ static int rtcan_raw_select(struct rtdm_fd *fd,
 {
     struct rtcan_socket *sock = rtdm_fd_to_private(fd);
 
-    rtdm_printk("%s: function called\n", __FUNCTION__);
-
     switch (type) {
 	case XNSELECT_READ:
 	    return rtdm_sem_select(&sock->recv_sem, selector, XNSELECT_READ, fd_index);
-	//case XNSELECT_WRITE:
-	//    return rtdm_event_select(&ts->send_evt, selector, XNSELECT_WRITE, fd_index);
+	case XNSELECT_WRITE:
+	{
+	    struct rtcan_device *dev;
+	    int ifindex = 0;
+
+	    if (!(ifindex = atomic_read(&sock->ifindex)))
+		return -ENXIO;
+
+	    if ((dev = rtcan_dev_get_by_index(ifindex)) == NULL)
+		return -ENXIO;
+
+	    return rtdm_sem_select(&dev->tx_sem, selector, XNSELECT_WRITE, fd_index);
+	}
 	default:
 	    return -EBADF;
     }
