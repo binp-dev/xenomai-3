@@ -972,24 +972,19 @@ static int rtcan_raw_select(struct rtdm_fd *fd,
 			    enum rtdm_selecttype type,
 			    unsigned fd_index)
 {
-    /*
-    struct tcp_socket *ts = rtdm_fd_to_private(fd);
+    struct rtcan_socket *sock = rtdm_fd_to_private(fd);
+
+    rtdm_printk("%s: function called\n", __FUNCTION__);
 
     switch (type) {
 	case XNSELECT_READ:
-	    return rtdm_sem_select(&ts->sock.pending_sem, selector,
-				XNSELECT_READ, fd_index);
-	case XNSELECT_WRITE:
-	    return rtdm_event_select(&ts->send_evt, selector,
-				    XNSELECT_WRITE, fd_index);
+	    return rtdm_sem_select(&sock->recv_sem, selector, XNSELECT_READ, fd_index);
+	//case XNSELECT_WRITE:
+	//    return rtdm_event_select(&ts->send_evt, selector, XNSELECT_WRITE, fd_index);
 	default:
 	    return -EBADF;
     }
 
-    return -EINVAL;
-    */
-
-    rtdm_printk("%s: function called\n", __FUNCTION__);
     return -EINVAL;
 }
 
@@ -1020,13 +1015,11 @@ static struct rtdm_device rtcan_device = {
 
 int __init rtcan_raw_proto_register(void)
 {
-    rtdm_printk("%s: function called\n", __FUNCTION__);
     return rtdm_dev_register(&rtcan_device);
 }
 
 void __exit rtcan_raw_proto_unregister(void)
 {
-    rtdm_printk("%s: function called\n", __FUNCTION__);
     rtdm_dev_unregister(&rtcan_device);
 }
 
